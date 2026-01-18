@@ -153,16 +153,6 @@ uv run main.py inspect
 
 ---
 
-## 📝 GitHub Metadata
-
-**Description:**
-Automate recurring Microsoft Bookings appointments using Python and Playwright. Features bulk scheduling, smart selector handling, and environment-based configuration. Ideal for office hours, recurring meetings, and university scheduling.
-
-**Topics:**
-`python`, `playwright`, `automation`, `microsoft-bookings`, `scheduling`, `selenium-alternative`, `bulk-booking`, `gmu`, `office-hours`, `browser-automation`
-
----
-
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
