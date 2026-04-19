@@ -12,8 +12,8 @@ def get_year_from_title(soup: BeautifulSoup) -> str:
 
 def parse_date_str(date_str: str, year: str) -> Optional[datetime.date]:
     """Parses a date string from the table into a python date object."""
-    # Remove day of week prefixes like 'Mon. '
-    date_str = re.sub(r'^[A-Za-z]+\.\s*', '', date_str)
+    # Remove day of week prefixes like 'Mon. ' or 'Friday, '
+    date_str = re.sub(r'^[A-Za-z]+[\.,]\s*', '', date_str)
     date_str = date_str.strip()
 
     # Handle abbreviation differences like 'Sept' instead of 'Sep'
