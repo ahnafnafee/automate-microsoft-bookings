@@ -20,11 +20,11 @@ def load_config() -> dict:
     # Load .env file
     load_dotenv()
     
-    # Check for required variables
+    # Check for required variables. Note: SEMESTER_START_DATE and SEMESTER_END_DATE
+    # are optional now because they can be dynamically fetched via book-semester.
     required_vars = [
         "BOOKING_URL", "BOOKING_SERVICE", "BOOKING_STAFF", 
-        "BOOKING_TIME_SLOT", "USER_NAME", "USER_EMAIL",
-        "SEMESTER_START_DATE", "SEMESTER_END_DATE"
+        "BOOKING_TIME_SLOT", "USER_NAME", "USER_EMAIL"
     ]
     
     missing = [var for var in required_vars if not os.getenv(var)]
@@ -84,24 +84,10 @@ def cli(ctx):
         sys.exit(1)
 
 
-@cli.command()
-@click.option("--dry-run", is_flag=True, help="Show dates without booking")
-@click.option("--headed", is_flag=True, help="Run browser in headed mode (visible)")
-@click.option("--workers", "-w", default=4, help="Number of parallel workers (default: 4)")
-@click.pass_context
-def book_all(ctx, dry_run, headed, workers):
-    """Book all Fridays in the configured semester range."""
+def execute_booking_run(config, fridays, dry_run, headed, workers):
+    """Helper to execute the booking loop using a list of dates."""
     import concurrent.futures
     from booker import run_single_booking
-    
-    config = ctx.obj["config"]
-    
-    # Get all Friday dates
-    start_date = config["semester"]["start_date"]
-    end_date = config["semester"]["end_date"]
-    skip_dates = config["semester"]["skip_dates"]
-    
-    fridays = get_fridays_in_range(start_date, end_date, skip_dates)
     
     click.echo(f"\n📅 Found {len(fridays)} Fridays to book:")
     click.echo("-" * 40)
@@ -157,6 +143,72 @@ def book_all(ctx, dry_run, headed, workers):
         for r in results:
             if not r["success"]:
                 click.echo(f"  - {r['date']}: {r['message']}")
+
+@cli.command()
+@click.option("--dry-run", is_flag=True, help="Show dates without booking")
+@click.option("--headed", is_flag=True, help="Run browser in headed mode (visible)")
+@click.option("--workers", "-w", default=4, help="Number of parallel workers (default: 4)")
+@click.pass_context
+def book_all(ctx, dry_run, headed, workers):
+    """Book all Fridays in the configured semester range."""
+    config = ctx.obj["config"]
+
+    # Get all Friday dates
+    start_date = config["semester"]["start_date"]
+    end_date = config["semester"]["end_date"]
+    skip_dates = config["semester"]["skip_dates"]
+
+    if not start_date or not end_date:
+        raise click.ClickException("SEMESTER_START_DATE and SEMESTER_END_DATE are required in .env for book-all")
+
+    fridays = get_fridays_in_range(start_date, end_date, skip_dates)
+    execute_booking_run(config, fridays, dry_run, headed, workers)
+
+@cli.command()
+@click.argument("semester", type=click.Choice(["fall", "spring", "summer"], case_sensitive=False))
+@click.argument("year", type=int)
+@click.option("--dry-run", is_flag=True, help="Show dates without booking")
+@click.option("--headed", is_flag=True, help="Run browser in headed mode (visible)")
+@click.option("--workers", "-w", default=4, help="Number of parallel workers (default: 4)")
+@click.pass_context
+def book_semester(ctx, semester, year, dry_run, headed, workers):
+    """Automatically fetch semester dates and book all Fridays."""
+    from calendar_parser import fetch_and_parse_calendar
+
+    config = ctx.obj["config"]
+
+    url = f"https://registrar.gmu.edu/calendars/{semester.lower()}_{year}/"
+    click.echo(f"\n🌐 Fetching academic calendar from: {url}")
+
+    try:
+        cal_data = fetch_and_parse_calendar(url)
+    except Exception as e:
+        raise click.ClickException(f"Failed to fetch or parse calendar: {e}")
+
+    if not cal_data:
+        raise click.ClickException(f"Could not parse dates from the calendar at {url}")
+
+    start_date = cal_data['start_date']
+    end_date = cal_data['end_date']
+    skip_dates = cal_data['skip_dates']
+
+    # Merge skip dates from env
+    env_skip_dates = config["semester"].get("skip_dates", [])
+    if env_skip_dates:
+        skip_dates.extend(env_skip_dates)
+
+    # Update config for downstream functions
+    config["semester"]["start_date"] = start_date
+    config["semester"]["end_date"] = end_date
+    config["semester"]["skip_dates"] = skip_dates
+
+    click.echo(f"🗓️  Parsed Semester Range: {start_date} to {end_date}")
+    if skip_dates:
+        click.echo(f"⏭️  Skipping Dates: {', '.join(skip_dates)}")
+
+    fridays = get_fridays_in_range(start_date, end_date, skip_dates)
+
+    execute_booking_run(config, fridays, dry_run, headed, workers)
 
 
 @cli.command()
