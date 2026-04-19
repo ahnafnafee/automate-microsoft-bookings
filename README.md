@@ -101,6 +101,16 @@ By default, the script runs with 4 parallel workers to speed up booking.
 uv run main.py book-all
 ```
 
+### 5. Auto-Fetch Semester Dates
+
+If you want to automatically fetch the start date, end date, and holidays for a specific semester directly from the GMU academic calendar, use the `book-semester` command.
+
+```bash
+uv run main.py book-semester fall 2026
+```
+
+This dynamically scrapes the registrar's website and schedules the dates based on the configured environment variables.
+
 To change the number of workers:
 
 ```bash
