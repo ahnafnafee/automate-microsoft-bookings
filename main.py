@@ -12,7 +12,36 @@ from datetime import date
 from dotenv import load_dotenv
 
 from date_utils import get_fridays_in_range, format_date_for_display
-from booker import BookingAutomation, BookingConfig
+from booker import BookingConfig, create_booking_automation
+
+
+BOOKING_BACKENDS = ("http", "playwright")
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise click.ClickException(f"{name} must be a number") from exc
+    if value <= 0:
+        raise click.ClickException(f"{name} must be greater than zero")
+    return value
+
+
+def _nonnegative_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise click.ClickException(f"{name} must be an integer") from exc
+    if value < 0:
+        raise click.ClickException(f"{name} cannot be negative")
+    return value
 
 
 def load_config() -> dict:
@@ -35,12 +64,23 @@ def load_config() -> dict:
     skip_dates_str = os.getenv("SKIP_DATES", "")
     skip_dates = [d.strip() for d in skip_dates_str.split(",")] if skip_dates_str else []
 
+    backend = os.getenv("BOOKING_BACKEND", "http").strip().casefold()
+    if backend not in BOOKING_BACKENDS:
+        raise click.ClickException(
+            f"BOOKING_BACKEND must be one of: {', '.join(BOOKING_BACKENDS)}"
+        )
+
     return {
         "booking": {
             "url": os.getenv("BOOKING_URL"),
             "service": os.getenv("BOOKING_SERVICE"),
             "staff": os.getenv("BOOKING_STAFF"),
             "time_slot": os.getenv("BOOKING_TIME_SLOT"),
+            "backend": backend,
+            "http_timeout": _positive_float_env("BOOKING_HTTP_TIMEOUT", 20.0),
+            "http_max_retries": _nonnegative_int_env(
+                "BOOKING_HTTP_MAX_RETRIES", 2
+            ),
         },
         "user": {
             "name": os.getenv("USER_NAME"),
@@ -57,7 +97,7 @@ def load_config() -> dict:
     }
 
 
-def create_booking_config(config: dict) -> BookingConfig:
+def create_booking_config(config: dict, backend: str | None = None) -> BookingConfig:
     """Create a BookingConfig from the config dict."""
     return BookingConfig(
         url=config["booking"]["url"],
@@ -69,6 +109,9 @@ def create_booking_config(config: dict) -> BookingConfig:
         address=config["user"]["address"],
         phone=config["user"]["phone"],
         notes=config["user"]["notes"],
+        backend=backend or config["booking"]["backend"],
+        http_timeout=config["booking"]["http_timeout"],
+        http_max_retries=config["booking"]["http_max_retries"],
     )
 
 
@@ -84,7 +127,7 @@ def cli(ctx):
         sys.exit(1)
 
 
-def execute_booking_run(config, fridays, dry_run, headed, workers):
+def execute_booking_run(config, fridays, dry_run, headed, workers, backend=None):
     """Helper to execute the booking loop using a list of dates."""
     import concurrent.futures
     from booker import run_single_booking
@@ -99,20 +142,34 @@ def execute_booking_run(config, fridays, dry_run, headed, workers):
         click.echo("\n🔍 DRY RUN - No bookings will be made.")
         return
     
+    selected_backend = backend or config["booking"]["backend"]
+
     # Confirm with user
-    if not click.confirm(f"\nProceed with booking {len(fridays)} dates using {workers} parallel workers?"):
+    if not click.confirm(
+        f"\nProceed with booking {len(fridays)} dates through the "
+        f"{selected_backend} backend using {workers} parallel workers?"
+    ):
         click.echo("Cancelled.")
         return
-    
-    click.echo(f"\n🚀 Starting parallel booking with {workers} workers...\n")
-    
+
+    if headed and selected_backend == "http":
+        click.echo("\nℹ️  --headed applies only to the Playwright backend.")
+    click.echo(
+        f"\n🚀 Starting {selected_backend} booking with {workers} parallel workers...\n"
+    )
+
     # Create booking config object once
-    booking_config = create_booking_config(config)
+    booking_config = create_booking_config(config, selected_backend)
     
     results = []
     
-    # Use ProcessPoolExecutor for parallel execution
-    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+    # HTTP work is I/O-bound; Playwright remains isolated in child processes.
+    executor_type = (
+        concurrent.futures.ThreadPoolExecutor
+        if selected_backend == "http"
+        else concurrent.futures.ProcessPoolExecutor
+    )
+    with executor_type(max_workers=workers) as executor:
         # Submit all tasks
         future_to_date = {
             executor.submit(run_single_booking, booking_config, friday, not headed): friday 
@@ -147,9 +204,22 @@ def execute_booking_run(config, fridays, dry_run, headed, workers):
 @cli.command()
 @click.option("--dry-run", is_flag=True, help="Show dates without booking")
 @click.option("--headed", is_flag=True, help="Run browser in headed mode (visible)")
-@click.option("--workers", "-w", default=4, help="Number of parallel workers (default: 4)")
+@click.option(
+    "--workers",
+    "-w",
+    default=4,
+    type=click.IntRange(min=1, max=16),
+    show_default=True,
+    help="Number of parallel workers",
+)
+@click.option(
+    "--backend",
+    type=click.Choice(BOOKING_BACKENDS, case_sensitive=False),
+    default=None,
+    help="Override BOOKING_BACKEND",
+)
 @click.pass_context
-def book_all(ctx, dry_run, headed, workers):
+def book_all(ctx, dry_run, headed, workers, backend):
     """Book all Fridays in the configured semester range."""
     config = ctx.obj["config"]
 
@@ -162,16 +232,29 @@ def book_all(ctx, dry_run, headed, workers):
         raise click.ClickException("SEMESTER_START_DATE and SEMESTER_END_DATE are required in .env for book-all")
 
     fridays = get_fridays_in_range(start_date, end_date, skip_dates)
-    execute_booking_run(config, fridays, dry_run, headed, workers)
+    execute_booking_run(config, fridays, dry_run, headed, workers, backend)
 
 @cli.command()
 @click.argument("semester", type=click.Choice(["fall", "spring", "summer"], case_sensitive=False))
 @click.argument("year", type=int)
 @click.option("--dry-run", is_flag=True, help="Show dates without booking")
 @click.option("--headed", is_flag=True, help="Run browser in headed mode (visible)")
-@click.option("--workers", "-w", default=4, help="Number of parallel workers (default: 4)")
+@click.option(
+    "--workers",
+    "-w",
+    default=4,
+    type=click.IntRange(min=1, max=16),
+    show_default=True,
+    help="Number of parallel workers",
+)
+@click.option(
+    "--backend",
+    type=click.Choice(BOOKING_BACKENDS, case_sensitive=False),
+    default=None,
+    help="Override BOOKING_BACKEND",
+)
 @click.pass_context
-def book_semester(ctx, semester, year, dry_run, headed, workers):
+def book_semester(ctx, semester, year, dry_run, headed, workers, backend):
     """Automatically fetch semester dates and book all Fridays."""
     from calendar_parser import fetch_and_parse_calendar
 
@@ -208,14 +291,20 @@ def book_semester(ctx, semester, year, dry_run, headed, workers):
 
     fridays = get_fridays_in_range(start_date, end_date, skip_dates)
 
-    execute_booking_run(config, fridays, dry_run, headed, workers)
+    execute_booking_run(config, fridays, dry_run, headed, workers, backend)
 
 
 @cli.command()
 @click.argument("date_str")
 @click.option("--headed", is_flag=True, help="Run browser in headed mode (visible)")
+@click.option(
+    "--backend",
+    type=click.Choice(BOOKING_BACKENDS, case_sensitive=False),
+    default=None,
+    help="Override BOOKING_BACKEND",
+)
 @click.pass_context
-def book_single(ctx, date_str, headed):
+def book_single(ctx, date_str, headed, backend):
     """Book a single specific date (format: YYYY-MM-DD)."""
     config = ctx.obj["config"]
     
@@ -235,8 +324,10 @@ def book_single(ctx, date_str, headed):
     click.echo(f"\n📅 Booking: {format_date_for_display(target_date)}")
     
     # Create automation instance
-    booking_config = create_booking_config(config)
-    automation = BookingAutomation(headless=not headed)
+    booking_config = create_booking_config(config, backend)
+    if headed and booking_config.backend == "http":
+        click.echo("ℹ️  --headed applies only to the Playwright backend.")
+    automation = create_booking_automation(booking_config, headless=not headed)
     
     result = automation.book_date(booking_config, target_date)
     

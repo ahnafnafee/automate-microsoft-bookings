@@ -1,168 +1,381 @@
+<div align="center"><a name="readme-top"></a>
+
 # Microsoft Bookings Automation
 
-[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg?style=for-the-badge)](https://www.python.org/downloads/)
-[![Playwright](https://img.shields.io/badge/Playwright-1.40+-green.svg?style=for-the-badge)](https://playwright.dev/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
+Schedule recurring office hours without waiting on a browser.
 
-A robust **Python automation tool** using **Playwright** to schedule recurring appointments on **Microsoft Bookings** pages. Initially designed for bulk-scheduling Graduate Teaching Assistant (GTA) Office Hours at George Mason University (GMU), this tool can be configured for any Microsoft Bookings service.
+**HTTP-first scheduling · live availability checks · Playwright fallback**
 
-> **Key Features:**
+[Quick Start](#-quick-start) · [Configuration](#️-configuration) · [Usage](#-usage) · [How It Works](#-how-it-works) · [Limitations](#️-safety--limitations)
+
+<!-- SHIELD GROUP -->
+
+[![][python-shield]][python-link]
+[![][httpx-shield]][httpx-link]
+[![][playwright-shield]][playwright-link]<br/>
+[![][test-shield]][test-link]
+[![][license-shield]][license-link]
+[![][stars-shield]][stars-link]
+[![][issues-shield]][issues-link]
+
+<sup>Built for GMU GTA Office Hours and configurable for unrestricted Microsoft Bookings pages.</sup>
+
+</div>
+
+<details>
+<summary><kbd>Table of contents</kbd></summary>
+
+#### TOC
+
+- [👋🏻 Overview](#-overview)
+- [✨ Features](#-features)
+- [🚀 Quick Start](#-quick-start)
+- [⚙️ Configuration](#️-configuration)
+- [📅 Usage](#-usage)
+  - [Preview dates](#preview-dates)
+  - [Book one appointment](#book-one-appointment)
+  - [Book a configured semester](#book-a-configured-semester)
+  - [Fetch the GMU semester automatically](#fetch-the-gmu-semester-automatically)
+  - [Select a backend](#select-a-backend)
+- [🧠 How It Works](#-how-it-works)
+- [🛡️ Safety & Limitations](#️-safety--limitations)
+- [🛠️ Development](#️-development)
+- [🐞 Troubleshooting](#-troubleshooting)
+- [📄 License](#-license)
+
+<br/>
+
+</details>
+
+## 👋🏻 Overview
+
+Microsoft Bookings Automation schedules recurring appointments from a small `.env` configuration. It was created for reserving a GMU GTA office-hours desk throughout a semester, including skipped holidays and breaks.
+
+The default backend talks directly to the anonymous API used by a published Microsoft Bookings page. It resolves the current service and staff IDs, checks the complete requested interval, and submits one appointment request—without starting Chromium or requiring Microsoft Graph permissions.
+
+> [!IMPORTANT]
 >
-> - 🗓️ **Bulk Scheduling**: Automate booking for an entire semester or custom date range.
-> - 🧩 **Smart Selectors**: Robust element detection that handles dynamic Microsof Bookings structures.
-> - ⚙️ **Configurable**: Driven by `.env` variables for easy adaptation to different services/staff.
-> - 🛠️ **Dev Tools**: Includes built-in `record` (codegen) and `inspect` modes for selector debugging.
-> - 🚀 **Headless & Headed**: Run silently in the background or watch the automation for verification.
+> The HTTP backend works only when the booking owner has intentionally published an unrestricted page. It does not bypass Microsoft 365 authentication or any other access control.
 
----
+<div align="right">
+
+[![][back-to-top]](#readme-top)
+
+</div>
+
+## ✨ Features
+
+### Fast HTTP scheduling
+
+- Reuses a lightweight `httpx` session instead of rendering the Bookings UI.
+- Resolves services and staff from the live page rather than hard-coding IDs.
+- Uses threaded workers for concurrent, I/O-bound semester bookings.
+- Retries throttled or transient **read-only** requests with backoff.
+
+### Availability-aware booking
+
+- Queries `GetStaffAvailability` before every appointment.
+- Verifies that the selected staff member is assigned to the service.
+- Checks that the full service duration fits inside an available interval.
+- Stops before submission when the requested slot is unavailable.
+
+### Conservative writes
+
+- Sends one appointment POST only after discovery and availability succeed.
+- Never automatically retries an appointment write after an ambiguous failure.
+- Returns the appointment ID when Microsoft includes one in the response.
+
+### Browser compatibility
+
+The original Playwright workflow remains available as a fallback when Microsoft changes the customer-facing protocol. Recorder and inspector commands are included for repairing UI selectors.
+
+<div align="right">
+
+[![][back-to-top]](#readme-top)
+
+</div>
 
 ## 🚀 Quick Start
 
-### Prerequisites
+### 1. Install
 
-- **Python 3.11+**
-- **uv** (Modern Python package manager, recommended) or pip
+```bash
+git clone https://github.com/ahnafnafee/automate-microsoft-bookings.git
+cd automate-microsoft-bookings
+uv sync
+```
 
-### Installation
+Python 3.11 or newer and [`uv`][uv-link] are required. The default HTTP backend does not require a browser download.
 
-1. **Install uv** (if missing):
+### 2. Configure
 
-    ```bash
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    ```
+```bash
+cp .env.example .env
+```
 
-2. **Sync Dependencies**:
+Open `.env` and replace the example customer details and semester dates as needed.
 
-    ```bash
-    uv sync
-    ```
+### 3. Preview
 
-3. **Install Browser Engines**:
-    ```bash
-    uv run playwright install chromium
-    ```
+```bash
+uv run book book-all --dry-run
+```
 
----
+### 4. Book
+
+```bash
+uv run book book-single 2026-08-21
+```
+
+> [!TIP]
+>
+> Start with one appointment. Confirm the resulting email and calendar entry before running a full semester.
+
+<div align="right">
+
+[![][back-to-top]](#readme-top)
+
+</div>
 
 ## ⚙️ Configuration
 
-1. **Create Environment File**:
+The CLI loads configuration from `.env` in the repository root.
 
-    ```bash
-    cp .env.example .env
-    ```
+| Variable | Required | Default | Description |
+| :--- | :---: | :--- | :--- |
+| `BOOKING_URL` | Yes | — | Published Microsoft Bookings page URL |
+| `BOOKING_SERVICE` | Yes | — | Exact or uniquely matching service title |
+| `BOOKING_STAFF` | Yes | — | Exact or uniquely matching staff/room name |
+| `BOOKING_TIME_SLOT` | Yes | — | Local business time, such as `2:00 PM` |
+| `BOOKING_BACKEND` | No | `http` | `http` or `playwright` |
+| `BOOKING_HTTP_TIMEOUT` | No | `20` | Per-request timeout in seconds |
+| `BOOKING_HTTP_MAX_RETRIES` | No | `2` | Retries for safe discovery and availability requests |
+| `USER_NAME` | Yes | — | Customer name sent with the appointment |
+| `USER_EMAIL` | Yes | — | Customer email sent with the appointment |
+| `USER_PHONE` | No | Empty | Optional customer phone number |
+| `USER_ADDRESS` | No | Empty | Optional customer address |
+| `USER_NOTES` | No | Empty | Optional appointment notes |
+| `SEMESTER_START_DATE` | For `book-all` | — | Inclusive start date in `YYYY-MM-DD` format |
+| `SEMESTER_END_DATE` | For `book-all` | — | Inclusive end date in `YYYY-MM-DD` format |
+| `SKIP_DATES` | No | Empty | Comma-separated dates to omit |
 
-2. **Update Settings** (`.env`):
+Example:
 
-    ```bash
-    # Booking Page URL
-    BOOKING_URL=https://outlook.office365.com/book/YOUR_SERVICE_PAGE
+```dotenv
+BOOKING_URL=https://outlook.office365.com/book/GTAOfficeHours@gmuedu.onmicrosoft.com/
+BOOKING_SERVICE="Office Hours 2 Hours"
+BOOKING_STAFF="ENGR 4456 D7"
+BOOKING_TIME_SLOT="2:00 PM"
+BOOKING_BACKEND=http
 
-    # Service Details (Exact text match or partial)
-    BOOKING_SERVICE="Office Hours 2 Hours"
-    BOOKING_STAFF="ENGR 4456 D7"
-    BOOKING_TIME_SLOT="2:00 PM"
+USER_NAME="First Last"
+USER_EMAIL="student@gmu.edu"
+USER_NOTES="Weekly GTA office hours"
 
-    # User Info
-    USER_NAME="Jane Doe"
-    USER_EMAIL="jdoe@example.edu"
-
-    # Schedule Range
-    SEMESTER_START_DATE="2026-01-23"
-    SEMESTER_END_DATE="2026-05-01"
-    SKIP_DATES="2026-03-13" # Comma-separated (e.g. Spring Break)
-    ```
-
----
-
-## 📚 Usage
-
-### 1. Verification
-
-List all dates that will be targeted based on your configuration.
-
-```bash
-uv run main.py list-dates
+SEMESTER_START_DATE="2026-08-24"
+SEMESTER_END_DATE="2026-12-07"
+SKIP_DATES="2026-09-07,2026-11-27"
 ```
 
-### 2. Dry Run
+> [!NOTE]
+>
+> Environment files are ignored by Git. Do not commit real customer information.
 
-Simulate the booking loop without submitting.
+<div align="right">
 
-```bash
-uv run main.py book-all --dry-run
-```
+[![][back-to-top]](#readme-top)
 
-### Book all Fridays (Parallel)
+</div>
 
-By default, the script runs with 4 parallel workers to speed up booking.
+## 📅 Usage
 
-```bash
-uv run main.py book-all
-```
+### Preview dates
 
-### 5. Auto-Fetch Semester Dates
-
-If you want to automatically fetch the start date, end date, and holidays for a specific semester directly from the GMU academic calendar, use the `book-semester` command.
+List the configured Fridays:
 
 ```bash
-uv run main.py book-semester fall 2026
+uv run book list-dates
 ```
 
-This dynamically scrapes the registrar's website and schedules the dates based on the configured environment variables.
-
-To change the number of workers:
+Preview the bulk operation without contacting the booking page:
 
 ```bash
-uv run main.py book-all --workers 8
+uv run book book-all --dry-run
 ```
 
-### Book with visible browser (Sequential)
-
-Headed mode usually works best sequentially for debugging, but parallel headed is supported (many windows will open).
+### Book one appointment
 
 ```bash
-uv run main.py book-all --headed --workers 1
+uv run book book-single 2026-08-21
 ```
 
-### 3. Book a Single Date
+The CLI warns before booking a date that is not a Friday.
 
-Test the flow on one specific day (recommended first step).
+### Book a configured semester
 
 ```bash
-uv run main.py book-single 2026-01-23 --headed
+uv run book book-all
 ```
 
-### 4. Bulk Automate
-
-Book the entire semester in one go.
+Choose the number of concurrent workers, from 1 through 16:
 
 ```bash
-uv run main.py book-all
+uv run book book-all --workers 4
 ```
 
----
+The command prints every target date, asks for confirmation, and reports each result independently.
 
-## 🐞 Debugging & Selector Discovery
-
-Microsoft Bookings pages can change. If the automation fails to find an element:
-
-**Interactive Recorder (Codegen)**
-Launches a browser that records your clicks and generates valid Playwright selectors for your specific page. Use this to update `booker.py` if needed.
+### Fetch the GMU semester automatically
 
 ```bash
-uv run main.py record
+uv run book book-semester fall 2026 --dry-run
+uv run book book-semester fall 2026
 ```
 
-**Manual Inspector**
-Opens the booking page in a headed browser with DevTools available for manual inspection.
+This command reads the GMU Registrar calendar, derives the semester range and closure dates, and then schedules the remaining Fridays. Calendar extraction currently uses Playwright, so install Chromium before using it:
 
 ```bash
-uv run main.py inspect
+uv run playwright install chromium
 ```
 
----
+### Select a backend
 
-## License
+The environment default can be overridden per command:
 
-MIT License - see [LICENSE](LICENSE) for details.
+```bash
+uv run book book-single 2026-08-21 --backend http
+uv run book book-single 2026-08-21 --backend playwright --headed
+uv run book book-all --backend playwright --workers 1
+```
+
+| Backend | Best for | Tradeoff |
+| :--- | :--- | :--- |
+| `http` | Fast, unrestricted public-page scheduling | Uses an undocumented Microsoft customer-page protocol |
+| `playwright` | UI fallback and selector troubleshooting | Requires Chromium and carries browser startup overhead |
+
+<div align="right">
+
+[![][back-to-top]](#readme-top)
+
+</div>
+
+## 🧠 How It Works
+
+```mermaid
+flowchart LR
+    A[Load .env] --> B[Open published page]
+    B --> C[Resolve service and staff]
+    C --> D[Check full interval]
+    D -->|Available| E[Create one appointment]
+    D -->|Unavailable| F[Stop without writing]
+```
+
+The HTTP backend follows the same anonymous workflow as the customer-facing page:
+
+1. Follow the configured URL to `bookings.cloud.microsoft` and establish the public session.
+2. Confirm that `BookingsAuthEnabled` is false.
+3. Fetch current business settings, services, and staff members.
+4. Resolve the configured names to their live identifiers.
+5. Query staff availability for the target date and service duration.
+6. Submit the appointment JSON through the page-scoped `/appointments` endpoint.
+
+The client sends no Microsoft Graph bearer token. The public page supplies a normal anonymous session cookie, while the request includes Microsoft’s anonymous `X-OWA-CANARY` value.
+
+<div align="right">
+
+[![][back-to-top]](#readme-top)
+
+</div>
+
+## 🛡️ Safety & Limitations
+
+> [!WARNING]
+>
+> Microsoft does not document the `BookingsService/api/V1/bookingBusinessesc2` customer-page protocol as a supported external API. It may change without notice. Keep the Playwright backend available and verify behavior after Microsoft Bookings updates.
+
+- Use this project only for pages and appointments you are authorized to book.
+- Authenticated or organization-restricted pages are rejected by the HTTP backend. Microsoft documents the distinction between unrestricted and tenant-restricted booking pages in its [booking-page access-control guidance][bookings-access-link].
+- Availability can change between the check and the final write. Microsoft remains the source of truth and may reject a raced slot.
+- Safe reads honor `429 Retry-After` responses. Appointment writes are intentionally not retried because a lost response could otherwise create duplicates.
+- The HTTP backend currently targets shared public Bookings pages, not personal Bookings pages or Microsoft Graph administration APIs.
+- Required custom questions and customer verification challenges are not currently modeled; use the Playwright backend for those pages.
+- High worker counts can trigger throttling or disrupt other customers. Use modest concurrency and respect the booking owner’s policies.
+
+<div align="right">
+
+[![][back-to-top]](#readme-top)
+
+</div>
+
+## 🛠️ Development
+
+Install all dependencies and run the test suite:
+
+```bash
+uv sync
+uv run pytest
+```
+
+The HTTP suite uses `httpx.MockTransport`; it exercises appointment creation without contacting Microsoft or creating a real booking.
+
+To inspect the public UI manually:
+
+```bash
+uv run playwright install chromium
+uv run book inspect
+```
+
+To record a replacement Playwright flow:
+
+```bash
+uv run book record
+```
+
+<div align="right">
+
+[![][back-to-top]](#readme-top)
+
+</div>
+
+## 🐞 Troubleshooting
+
+| Symptom | What to check |
+| :--- | :--- |
+| “requires Microsoft 365 authentication” | The owner restricted the page to its organization; use an authorized workflow instead |
+| Service or staff not found | Copy the visible title exactly or use a unique substring |
+| Slot unavailable | Confirm the date, local business time, service duration, and selected staff member |
+| HTTP `429` | Reduce `--workers`; safe requests automatically honor Microsoft’s retry delay |
+| HTTP protocol failure after a Bookings update | Retry with `--backend playwright` and inspect the changed page |
+| Playwright executable missing | Run `uv run playwright install chromium` |
+
+When reporting a problem, omit `.env` contents, customer information, cookies, and request tokens.
+
+<div align="right">
+
+[![][back-to-top]](#readme-top)
+
+</div>
+
+## 📄 License
+
+Released under the [MIT License][license-link].
+
+<!-- LINK GROUP -->
+
+[back-to-top]: https://img.shields.io/badge/-BACK_TO_TOP-151515?style=flat-square
+[bookings-access-link]: https://learn.microsoft.com/en-us/microsoft-365/bookings/customize-booking-page?view=o365-worldwide
+[httpx-link]: https://www.python-httpx.org/
+[httpx-shield]: https://img.shields.io/badge/HTTPX-0.28+-5A29E4?style=flat-square&logo=python&logoColor=white
+[issues-link]: https://github.com/ahnafnafee/automate-microsoft-bookings/issues
+[issues-shield]: https://img.shields.io/github/issues/ahnafnafee/automate-microsoft-bookings?style=flat-square&logo=github
+[license-link]: ./LICENSE
+[license-shield]: https://img.shields.io/github/license/ahnafnafee/automate-microsoft-bookings?style=flat-square
+[playwright-link]: https://playwright.dev/python/
+[playwright-shield]: https://img.shields.io/badge/Playwright-Fallback-2EAD33?style=flat-square&logo=playwright&logoColor=white
+[python-link]: https://www.python.org/
+[python-shield]: https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white
+[stars-link]: https://github.com/ahnafnafee/automate-microsoft-bookings/stargazers
+[stars-shield]: https://img.shields.io/github/stars/ahnafnafee/automate-microsoft-bookings?style=flat-square&logo=github
+[test-link]: https://github.com/ahnafnafee/automate-microsoft-bookings/actions/workflows/ci.yml
+[test-shield]: https://img.shields.io/github/actions/workflow/status/ahnafnafee/automate-microsoft-bookings/ci.yml?branch=main&label=tests&style=flat-square&logo=github
+[uv-link]: https://docs.astral.sh/uv/

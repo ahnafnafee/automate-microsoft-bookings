@@ -15,6 +15,7 @@ def mock_env(monkeypatch):
     monkeypatch.setenv("BOOKING_TIME_SLOT", "12:00 PM")
     monkeypatch.setenv("USER_NAME", "Jane Doe")
     monkeypatch.setenv("USER_EMAIL", "jane@doe.com")
+    monkeypatch.delenv("BOOKING_BACKEND", raising=False)
 
 def test_book_all_requires_env_dates(runner, mock_env, monkeypatch):
     # book-all requires SEMESTER_START_DATE and SEMESTER_END_DATE to be set
@@ -57,3 +58,42 @@ def test_book_semester_success(runner, mock_env, mocker):
     fridays = args[1]
     # Jan 20 to May 4 is 15 weeks. March 13 is skipped.
     assert len(fridays) == 14
+
+
+def test_http_is_default_backend(runner, mock_env, monkeypatch, mocker):
+    automation = mocker.Mock()
+    automation.book_date.return_value = {
+        "success": True,
+        "message": "Booked through HTTP",
+        "date": "2026-08-21",
+    }
+    factory = mocker.patch("main.create_booking_automation", return_value=automation)
+
+    result = runner.invoke(cli, ["book-single", "2026-08-21"])
+
+    assert result.exit_code == 0
+    booking_config = factory.call_args.args[0]
+    assert booking_config.backend == "http"
+    automation.book_date.assert_called_once()
+
+
+def test_book_single_can_override_playwright_backend(
+    runner, mock_env, mocker
+):
+    automation = mocker.Mock()
+    automation.book_date.return_value = {
+        "success": True,
+        "message": "Booked through Playwright",
+        "date": "2026-08-21",
+    }
+    factory = mocker.patch("main.create_booking_automation", return_value=automation)
+
+    result = runner.invoke(
+        cli,
+        ["book-single", "2026-08-21", "--backend", "playwright", "--headed"],
+    )
+
+    assert result.exit_code == 0
+    booking_config = factory.call_args.args[0]
+    assert booking_config.backend == "playwright"
+    assert factory.call_args.kwargs["headless"] is False
