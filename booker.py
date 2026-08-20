@@ -1,12 +1,12 @@
+"""Microsoft Bookings automation backends.
+
+The HTTP backend is selected by default; ``BookingAutomation`` preserves the
+original Playwright workflow as a browser fallback.
 """
-Microsoft Bookings automation using Playwright.
-Automates the booking of GTA Office Hours on the GMU booking page.
-"""
-import time
 from datetime import date
 from pathlib import Path
 from dataclasses import dataclass
-from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import Page, sync_playwright
 
 
 @dataclass
@@ -21,6 +21,9 @@ class BookingConfig:
     address: str = ""
     phone: str = ""
     notes: str = ""
+    backend: str = "http"
+    http_timeout: float = 20.0
+    http_max_retries: int = 2
 
 
 class BookingAutomation:
@@ -280,10 +283,25 @@ class BookingAutomation:
             pass
 
 
+def create_booking_automation(config: BookingConfig, headless: bool = True):
+    """Create the configured booking backend."""
+    backend = config.backend.casefold()
+    if backend == "http":
+        from bookings_http import HttpBookingAutomation
+
+        return HttpBookingAutomation(
+            timeout=config.http_timeout,
+            max_retries=config.http_max_retries,
+        )
+    if backend == "playwright":
+        return BookingAutomation(headless=headless)
+    raise ValueError(f"Unsupported booking backend: {config.backend}")
+
+
 def run_single_booking(config: BookingConfig, target_date: date, headless: bool = True) -> dict:
     """
     Helper function for parallel execution.
     Instantiates automation and runs a single booking.
     """
-    automation = BookingAutomation(headless=headless)
+    automation = create_booking_automation(config, headless=headless)
     return automation.book_date(config, target_date)
