@@ -113,7 +113,7 @@ Python 3.11 or newer and [`uv`][uv-link] are required. The default HTTP backend 
 cp .env.example .env
 ```
 
-Open `.env` and replace the example customer details and semester dates as needed.
+Open `.env` and replace the example customer details and semester dates as needed. A GMU calendar dry run can be used before booking details are configured.
 
 ### 3. Preview
 
@@ -141,7 +141,7 @@ uv run book book-single 2026-08-21
 
 The CLI loads configuration from `.env` in the repository root.
 
-| Variable | Required | Default | Description |
+| Variable | Required to book | Default | Description |
 | :--- | :---: | :--- | :--- |
 | `BOOKING_URL` | Yes | — | Published Microsoft Bookings page URL |
 | `BOOKING_SERVICE` | Yes | — | Exact or uniquely matching service title |
@@ -237,6 +237,8 @@ This command reads the GMU Registrar calendar, derives the semester range and cl
 ```bash
 uv run playwright install chromium
 ```
+
+`--dry-run` needs no booking URL, service, staff, time slot, name, or email. Those values are validated only when a command could submit an appointment.
 
 ### Select a backend
 

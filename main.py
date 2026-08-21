@@ -16,11 +16,18 @@ from booker import BookingConfig, create_booking_automation
 
 
 BOOKING_BACKENDS = ("http", "playwright")
+REQUIRED_BOOKING_FIELDS = (
+    ("BOOKING_URL", "booking", "url"),
+    ("BOOKING_SERVICE", "booking", "service"),
+    ("BOOKING_STAFF", "booking", "staff"),
+    ("BOOKING_TIME_SLOT", "booking", "time_slot"),
+    ("USER_NAME", "user", "name"),
+    ("USER_EMAIL", "user", "email"),
+)
 
 
-def _positive_float_env(name: str, default: float) -> float:
-    raw_value = os.getenv(name)
-    if raw_value is None or not raw_value.strip():
+def _positive_float(raw_value, name: str, default: float) -> float:
+    if raw_value is None or not str(raw_value).strip():
         return default
     try:
         value = float(raw_value)
@@ -31,9 +38,8 @@ def _positive_float_env(name: str, default: float) -> float:
     return value
 
 
-def _nonnegative_int_env(name: str, default: int) -> int:
-    raw_value = os.getenv(name)
-    if raw_value is None or not raw_value.strip():
+def _nonnegative_int(raw_value, name: str, default: int) -> int:
+    if raw_value is None or not str(raw_value).strip():
         return default
     try:
         value = int(raw_value)
@@ -45,30 +51,13 @@ def _nonnegative_int_env(name: str, default: int) -> int:
 
 
 def load_config() -> dict:
-    """Load configuration from environment variables."""
+    """Load configuration without validating command-specific fields."""
     # Load .env file
     load_dotenv()
-    
-    # Check for required variables. Note: SEMESTER_START_DATE and SEMESTER_END_DATE
-    # are optional now because they can be dynamically fetched via book-semester.
-    required_vars = [
-        "BOOKING_URL", "BOOKING_SERVICE", "BOOKING_STAFF", 
-        "BOOKING_TIME_SLOT", "USER_NAME", "USER_EMAIL"
-    ]
-    
-    missing = [var for var in required_vars if not os.getenv(var)]
-    if missing:
-        raise click.ClickException(f"Missing required environment variables: {', '.join(missing)}")
 
     # Parse skip dates (comma separated)
     skip_dates_str = os.getenv("SKIP_DATES", "")
     skip_dates = [d.strip() for d in skip_dates_str.split(",")] if skip_dates_str else []
-
-    backend = os.getenv("BOOKING_BACKEND", "http").strip().casefold()
-    if backend not in BOOKING_BACKENDS:
-        raise click.ClickException(
-            f"BOOKING_BACKEND must be one of: {', '.join(BOOKING_BACKENDS)}"
-        )
 
     return {
         "booking": {
@@ -76,11 +65,9 @@ def load_config() -> dict:
             "service": os.getenv("BOOKING_SERVICE"),
             "staff": os.getenv("BOOKING_STAFF"),
             "time_slot": os.getenv("BOOKING_TIME_SLOT"),
-            "backend": backend,
-            "http_timeout": _positive_float_env("BOOKING_HTTP_TIMEOUT", 20.0),
-            "http_max_retries": _nonnegative_int_env(
-                "BOOKING_HTTP_MAX_RETRIES", 2
-            ),
+            "backend": os.getenv("BOOKING_BACKEND", "http"),
+            "http_timeout": os.getenv("BOOKING_HTTP_TIMEOUT"),
+            "http_max_retries": os.getenv("BOOKING_HTTP_MAX_RETRIES"),
         },
         "user": {
             "name": os.getenv("USER_NAME"),
@@ -98,7 +85,39 @@ def load_config() -> dict:
 
 
 def create_booking_config(config: dict, backend: str | None = None) -> BookingConfig:
-    """Create a BookingConfig from the config dict."""
+    """Validate write-path settings and create a BookingConfig."""
+    missing = [
+        env_name
+        for env_name, section, field in REQUIRED_BOOKING_FIELDS
+        if not str(config[section].get(field) or "").strip()
+    ]
+    if missing:
+        raise click.ClickException(
+            f"Missing required environment variables: {', '.join(missing)}"
+        )
+
+    selected_backend = str(
+        backend or config["booking"].get("backend") or "http"
+    ).strip().casefold()
+    if selected_backend not in BOOKING_BACKENDS:
+        raise click.ClickException(
+            f"BOOKING_BACKEND must be one of: {', '.join(BOOKING_BACKENDS)}"
+        )
+
+    http_timeout = 20.0
+    http_max_retries = 2
+    if selected_backend == "http":
+        http_timeout = _positive_float(
+            config["booking"].get("http_timeout"),
+            "BOOKING_HTTP_TIMEOUT",
+            20.0,
+        )
+        http_max_retries = _nonnegative_int(
+            config["booking"].get("http_max_retries"),
+            "BOOKING_HTTP_MAX_RETRIES",
+            2,
+        )
+
     return BookingConfig(
         url=config["booking"]["url"],
         service=config["booking"]["service"],
@@ -109,10 +128,20 @@ def create_booking_config(config: dict, backend: str | None = None) -> BookingCo
         address=config["user"]["address"],
         phone=config["user"]["phone"],
         notes=config["user"]["notes"],
-        backend=backend or config["booking"]["backend"],
-        http_timeout=config["booking"]["http_timeout"],
-        http_max_retries=config["booking"]["http_max_retries"],
+        backend=selected_backend,
+        http_timeout=http_timeout,
+        http_max_retries=http_max_retries,
     )
+
+
+def require_booking_url(config: dict) -> str:
+    """Return the booking URL required by browser utility commands."""
+    url = config["booking"].get("url")
+    if not str(url or "").strip():
+        raise click.ClickException(
+            "Missing required environment variable: BOOKING_URL"
+        )
+    return url
 
 
 @click.group()
@@ -142,7 +171,8 @@ def execute_booking_run(config, fridays, dry_run, headed, workers, backend=None)
         click.echo("\n🔍 DRY RUN - No bookings will be made.")
         return
     
-    selected_backend = backend or config["booking"]["backend"]
+    booking_config = create_booking_config(config, backend)
+    selected_backend = booking_config.backend
 
     # Confirm with user
     if not click.confirm(
@@ -158,9 +188,6 @@ def execute_booking_run(config, fridays, dry_run, headed, workers, backend=None)
         f"\n🚀 Starting {selected_backend} booking with {workers} parallel workers...\n"
     )
 
-    # Create booking config object once
-    booking_config = create_booking_config(config, selected_backend)
-    
     results = []
     
     # HTTP work is I/O-bound; Playwright remains isolated in child processes.
@@ -273,12 +300,9 @@ def book_semester(ctx, semester, year, dry_run, headed, workers, backend):
 
     start_date = cal_data['start_date']
     end_date = cal_data['end_date']
-    skip_dates = cal_data['skip_dates']
-
-    # Merge skip dates from env
+    # Merge live and configured closures without printing or processing duplicates.
     env_skip_dates = config["semester"].get("skip_dates", [])
-    if env_skip_dates:
-        skip_dates.extend(env_skip_dates)
+    skip_dates = sorted(set(cal_data['skip_dates']) | set(env_skip_dates))
 
     # Update config for downstream functions
     config["semester"]["start_date"] = start_date
@@ -346,6 +370,12 @@ def list_dates(ctx):
     start_date = config["semester"]["start_date"]
     end_date = config["semester"]["end_date"]
     skip_dates = config["semester"]["skip_dates"]
+
+    if not start_date or not end_date:
+        raise click.ClickException(
+            "SEMESTER_START_DATE and SEMESTER_END_DATE are required in .env "
+            "for list-dates"
+        )
     
     fridays = get_fridays_in_range(start_date, end_date, skip_dates)
     
@@ -371,7 +401,7 @@ def record(ctx):
     """
     import subprocess
     config = ctx.obj["config"]
-    url = config["booking"]["url"]
+    url = require_booking_url(config)
     
     click.echo("\n🎬 Launching Playwright Codegen...")
     click.echo("   Perform the booking manually and copy the selectors!")
@@ -390,7 +420,7 @@ def inspect(ctx):
     """
     from playwright.sync_api import sync_playwright
     config = ctx.obj["config"]
-    url = config["booking"]["url"]
+    url = require_booking_url(config)
     
     click.echo("\n🔍 Opening booking page for inspection...")
     click.echo("   Use browser DevTools (F12) to inspect elements.")
