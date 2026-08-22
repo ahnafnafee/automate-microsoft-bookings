@@ -1,9 +1,54 @@
-"""
-Date utilities for generating Friday booking dates.
-"""
+"""Date utilities for generating recurring booking dates."""
 from datetime import date, timedelta
 from typing import List
 from dateutil.parser import parse
+
+
+WEEKDAY_NAMES = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+
+
+def get_weekdays_in_range(
+    start_date: str | date,
+    end_date: str | date,
+    weekday: int,
+    skip_dates: List[str] | None = None,
+) -> List[date]:
+    """Generate one recurring weekday in an inclusive date range."""
+    if weekday not in range(7):
+        raise ValueError("weekday must be an integer from 0 (Monday) to 6 (Sunday)")
+
+    if isinstance(start_date, str):
+        start_date = parse(start_date).date()
+    if isinstance(end_date, str):
+        end_date = parse(end_date).date()
+
+    skip_set = set()
+    if skip_dates:
+        for skipped_date in skip_dates:
+            if isinstance(skipped_date, str):
+                skip_set.add(parse(skipped_date).date())
+            else:
+                skip_set.add(skipped_date)
+
+    matching_dates = []
+    current = start_date
+    days_until_weekday = (weekday - current.weekday()) % 7
+    current += timedelta(days=days_until_weekday)
+
+    while current <= end_date:
+        if current not in skip_set:
+            matching_dates.append(current)
+        current += timedelta(days=7)
+
+    return matching_dates
 
 
 def get_fridays_in_range(
@@ -23,36 +68,7 @@ def get_fridays_in_range(
     Returns:
         List of date objects for each Friday in the range
     """
-    # Parse dates if they're strings
-    if isinstance(start_date, str):
-        start_date = parse(start_date).date()
-    if isinstance(end_date, str):
-        end_date = parse(end_date).date()
-    
-    # Parse skip dates
-    skip_set = set()
-    if skip_dates:
-        for d in skip_dates:
-            if isinstance(d, str):
-                skip_set.add(parse(d).date())
-            else:
-                skip_set.add(d)
-    
-    fridays = []
-    current = start_date
-    
-    # Move to first Friday if start_date isn't a Friday
-    days_until_friday = (4 - current.weekday()) % 7
-    if days_until_friday > 0:
-        current += timedelta(days=days_until_friday)
-    
-    # Collect all Fridays
-    while current <= end_date:
-        if current not in skip_set:
-            fridays.append(current)
-        current += timedelta(days=7)
-    
-    return fridays
+    return get_weekdays_in_range(start_date, end_date, 4, skip_dates)
 
 
 def format_date_for_display(d: date) -> str:

@@ -1,6 +1,14 @@
 import os
 import pytest
 from click.testing import CliRunner
+from booker import BookingConfig
+from booking_ledger import (
+    active_bookings,
+    begin_run,
+    finish_run,
+    list_runs,
+    record_booking_result,
+)
 from main import cli
 
 
@@ -18,11 +26,15 @@ def runner():
     return CliRunner()
 
 @pytest.fixture
-def mock_env(monkeypatch):
+def mock_env(monkeypatch, tmp_path):
     monkeypatch.setenv("BOOKING_URL", "http://test.com")
     monkeypatch.setenv("BOOKING_SERVICE", "Service")
     monkeypatch.setenv("BOOKING_STAFF", "Staff")
     monkeypatch.setenv("BOOKING_TIME_SLOT", "12:00 PM")
+    monkeypatch.setenv("BOOKING_WEEKDAY", "friday")
+    monkeypatch.setenv(
+        "BOOKING_LEDGER_PATH", str(tmp_path / "bookings.sqlite3")
+    )
     monkeypatch.setenv("USER_NAME", "Jane Doe")
     monkeypatch.setenv("USER_EMAIL", "jane@doe.com")
     monkeypatch.delenv("BOOKING_BACKEND", raising=False)
@@ -102,6 +114,35 @@ def test_book_semester_dry_run_does_not_require_booking_config(
     run_single_booking.assert_not_called()
 
 
+def test_book_semester_uses_configured_thursday(
+    runner, mock_env, monkeypatch, mocker
+):
+    monkeypatch.setenv("BOOKING_WEEKDAY", "thursday")
+    monkeypatch.setenv("BOOKING_TIME_SLOT", "4:00 PM")
+    monkeypatch.setenv("SKIP_DATES", "")
+    mocker.patch(
+        "calendar_parser.fetch_and_parse_calendar",
+        return_value={
+            "start_date": "2026-08-24",
+            "end_date": "2026-12-07",
+            "skip_dates": ["2026-11-26"],
+        },
+    )
+    mock_execute = mocker.patch("main.execute_booking_run")
+
+    result = runner.invoke(
+        cli, ["book-semester", "fall", "2026", "--dry-run"]
+    )
+
+    assert result.exit_code == 0
+    booking_dates = mock_execute.call_args.args[1]
+    assert booking_dates[0].isoformat() == "2026-08-27"
+    assert booking_dates[-1].isoformat() == "2026-12-03"
+    assert len(booking_dates) == 14
+    assert all(booking_date.weekday() == 3 for booking_date in booking_dates)
+    assert mock_execute.call_args.kwargs["weekday"] == "thursday"
+
+
 def test_book_single_still_requires_booking_config(runner, monkeypatch, mocker):
     for variable in REQUIRED_BOOKING_ENV_VARS:
         monkeypatch.setenv(variable, "")
@@ -153,3 +194,124 @@ def test_book_single_can_override_playwright_backend(
     booking_config = factory.call_args.args[0]
     assert booking_config.backend == "playwright"
     assert factory.call_args.kwargs["headless"] is False
+
+
+def test_cancel_all_dry_run_never_contacts_microsoft(
+    runner, mock_env, monkeypatch, mocker, tmp_path
+):
+    ledger_path = tmp_path / "cancel-dry-run.sqlite3"
+    config = BookingConfig(
+        url="https://bookings.example.edu/book/office-hours/",
+        service="Office Hours 2 Hours",
+        staff="Room 101",
+        time_slot="4:00 PM",
+        name="Jane Doe",
+        email="jane@example.edu",
+    )
+    run_id = begin_run(
+        ledger_path,
+        config,
+        command="book-semester fall 2026",
+        booking_dates=["2026-08-27"],
+        weekday="thursday",
+    )
+    record_booking_result(
+        ledger_path,
+        run_id,
+        {
+            "success": True,
+            "date": "2026-08-27",
+            "backend": "http",
+            "self_service_appointment_id": "self-service-123",
+        },
+    )
+    finish_run(ledger_path, run_id)
+    monkeypatch.setenv("BOOKING_LEDGER_PATH", str(ledger_path))
+    cancel = mocker.patch(
+        "bookings_http.HttpBookingAutomation.cancel_appointment"
+    )
+
+    result = runner.invoke(cli, ["cancel-all", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "DRY RUN - No cancellations will be made." in result.output
+    cancel.assert_not_called()
+
+
+def test_cancel_all_marks_successful_cancellation(
+    runner, mock_env, monkeypatch, mocker, tmp_path
+):
+    ledger_path = tmp_path / "cancel.sqlite3"
+    config = BookingConfig(
+        url="https://bookings.example.edu/book/office-hours/",
+        service="Office Hours 2 Hours",
+        staff="Room 101",
+        time_slot="4:00 PM",
+        name="Jane Doe",
+        email="jane@example.edu",
+    )
+    run_id = begin_run(
+        ledger_path,
+        config,
+        command="book-semester fall 2026",
+        booking_dates=["2026-08-27"],
+        weekday="thursday",
+    )
+    record_booking_result(
+        ledger_path,
+        run_id,
+        {
+            "success": True,
+            "date": "2026-08-27",
+            "backend": "http",
+            "self_service_appointment_id": "self-service-123",
+        },
+    )
+    finish_run(ledger_path, run_id)
+    monkeypatch.setenv("BOOKING_LEDGER_PATH", str(ledger_path))
+    cancel = mocker.patch(
+        "bookings_http.HttpBookingAutomation.cancel_appointment",
+        return_value={
+            "success": True,
+            "message": "Successfully cancelled appointment via HTTP",
+        },
+    )
+
+    result = runner.invoke(cli, ["cancel-all"], input="y\n")
+
+    assert result.exit_code == 0
+    cancel.assert_called_once_with(
+        "https://bookings.example.edu/book/office-hours/",
+        "self-service-123",
+    )
+    assert active_bookings(ledger_path) == []
+
+
+def test_list_runs_displays_local_history(
+    runner, mock_env, monkeypatch, tmp_path
+):
+    database_path = tmp_path / "history.sqlite3"
+    config = BookingConfig(
+        url="https://bookings.example.edu/book/office-hours/",
+        service="Office Hours 2 Hours",
+        staff="Room 101",
+        time_slot="4:00 PM",
+        name="Jane Doe",
+        email="jane@example.edu",
+    )
+    run_id = begin_run(
+        database_path,
+        config,
+        command="book-semester fall 2026",
+        booking_dates=["2026-08-27"],
+        weekday="thursday",
+    )
+    finish_run(database_path, run_id)
+    monkeypatch.setenv("BOOKING_LEDGER_PATH", str(database_path))
+
+    result = runner.invoke(cli, ["list-runs"])
+
+    assert result.exit_code == 0
+    assert run_id in result.output
+    assert "book-semester fall 2026" in result.output
+    assert list_runs(database_path)[0]["run_id"] == run_id

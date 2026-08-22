@@ -4,7 +4,7 @@
 
 Schedule recurring office hours without waiting on a browser.
 
-**HTTP-first scheduling · live availability checks · Playwright fallback**
+**HTTP-first scheduling · live availability checks · local cancellation history**
 
 [Quick Start](#-quick-start) · [Configuration](#️-configuration) · [Usage](#-usage) · [How It Works](#-how-it-works) · [Limitations](#️-safety--limitations)
 
@@ -36,6 +36,7 @@ Schedule recurring office hours without waiting on a browser.
   - [Book one appointment](#book-one-appointment)
   - [Book a configured semester](#book-a-configured-semester)
   - [Fetch the GMU semester automatically](#fetch-the-gmu-semester-automatically)
+  - [Review and cancel booking runs](#review-and-cancel-booking-runs)
   - [Select a backend](#select-a-backend)
 - [🧠 How It Works](#-how-it-works)
 - [🛡️ Safety & Limitations](#️-safety--limitations)
@@ -84,6 +85,13 @@ The default backend talks directly to the anonymous API used by a published Micr
 - Sends one appointment POST only after discovery and availability succeed.
 - Never automatically retries an appointment write after an ambiguous failure.
 - Returns the appointment ID when Microsoft includes one in the response.
+
+### Local history and cancellation
+
+- Records every booking run and appointment result in an ignored SQLite database.
+- Stores Microsoft customer self-service IDs only on the local machine.
+- Previews bulk cancellations before sending any writes.
+- Never retries a cancellation after an ambiguous response.
 
 ### Browser compatibility
 
@@ -147,9 +155,11 @@ The CLI loads configuration from `.env` in the repository root.
 | `BOOKING_SERVICE` | Yes | — | Exact or uniquely matching service title |
 | `BOOKING_STAFF` | Yes | — | Exact or uniquely matching staff/room name |
 | `BOOKING_TIME_SLOT` | Yes | — | Local business time, such as `2:00 PM` |
+| `BOOKING_WEEKDAY` | No | `friday` | Recurring weekday from `monday` through `sunday` |
 | `BOOKING_BACKEND` | No | `http` | `http` or `playwright` |
 | `BOOKING_HTTP_TIMEOUT` | No | `20` | Per-request timeout in seconds |
 | `BOOKING_HTTP_MAX_RETRIES` | No | `2` | Retries for safe discovery and availability requests |
+| `BOOKING_LEDGER_PATH` | No | `.bookings/bookings.sqlite3` | Ignored SQLite run and cancellation history |
 | `USER_NAME` | Yes | — | Customer name sent with the appointment |
 | `USER_EMAIL` | Yes | — | Customer email sent with the appointment |
 | `USER_PHONE` | No | Empty | Optional customer phone number |
@@ -166,7 +176,9 @@ BOOKING_URL=https://outlook.office365.com/book/GTAOfficeHours@gmuedu.onmicrosoft
 BOOKING_SERVICE="Office Hours 2 Hours"
 BOOKING_STAFF="ENGR 4456 D7"
 BOOKING_TIME_SLOT="2:00 PM"
+BOOKING_WEEKDAY=friday
 BOOKING_BACKEND=http
+BOOKING_LEDGER_PATH=".bookings/bookings.sqlite3"
 
 USER_NAME="First Last"
 USER_EMAIL="student@gmu.edu"
@@ -191,7 +203,7 @@ SKIP_DATES="2026-09-07,2026-11-27"
 
 ### Preview dates
 
-List the configured Fridays:
+List the configured recurring weekday:
 
 ```bash
 uv run book list-dates
@@ -209,7 +221,7 @@ uv run book book-all --dry-run
 uv run book book-single 2026-08-21
 ```
 
-The CLI warns before booking a date that is not a Friday.
+The CLI warns before booking a date that does not match `BOOKING_WEEKDAY`.
 
 ### Book a configured semester
 
@@ -230,15 +242,35 @@ The command prints every target date, asks for confirmation, and reports each re
 ```bash
 uv run book book-semester fall 2026 --dry-run
 uv run book book-semester fall 2026
+uv run book book-semester fall 2026 --weekday thursday --dry-run
 ```
 
-This command reads the GMU Registrar calendar, derives the semester range and closure dates, and then schedules the remaining Fridays. Calendar extraction currently uses Playwright, so install Chromium before using it:
+This command reads the GMU Registrar calendar, derives the semester range and closure dates, and then schedules the configured weekday. Use `--weekday` to override `.env` for one run. Calendar extraction currently uses Playwright, so install Chromium before using it:
 
 ```bash
 uv run playwright install chromium
 ```
 
 `--dry-run` needs no booking URL, service, staff, time slot, name, or email. Those values are validated only when a command could submit an appointment.
+
+### Review and cancel booking runs
+
+Successful and failed appointment attempts are grouped under a local run ID. Review the history and preview all active cancellations:
+
+```bash
+uv run book list-runs
+uv run book cancel-all --dry-run
+```
+
+Cancel only one run, or constrain the selection by date:
+
+```bash
+uv run book cancel-all --run-id <run-id> --dry-run
+uv run book cancel-all --run-id <run-id>
+uv run book cancel-all --from-date 2026-08-24 --to-date 2026-12-07 --dry-run
+```
+
+The non-dry command asks for confirmation. Automatic cancellation applies only when Microsoft returned a customer self-service appointment ID; older or Playwright-created records without that ID remain visible as requiring manual cancellation.
 
 ### Select a backend
 
@@ -270,6 +302,8 @@ flowchart LR
     C --> D[Check full interval]
     D -->|Available| E[Create one appointment]
     D -->|Unavailable| F[Stop without writing]
+    E --> G[Store run and self-service ID in SQLite]
+    G --> H[Optional guarded cancellation]
 ```
 
 The HTTP backend follows the same anonymous workflow as the customer-facing page:
@@ -280,6 +314,7 @@ The HTTP backend follows the same anonymous workflow as the customer-facing page
 4. Resolve the configured names to their live identifiers.
 5. Query staff availability for the target date and service duration.
 6. Submit the appointment JSON through the page-scoped `/appointments` endpoint.
+7. Store the result under a local run ID for inspection and optional cancellation.
 
 The client sends no Microsoft Graph bearer token. The public page supplies a normal anonymous session cookie, while the request includes Microsoft’s anonymous `X-OWA-CANARY` value.
 
@@ -299,6 +334,8 @@ The client sends no Microsoft Graph bearer token. The public page supplies a nor
 - Authenticated or organization-restricted pages are rejected by the HTTP backend. Microsoft documents the distinction between unrestricted and tenant-restricted booking pages in its [booking-page access-control guidance][bookings-access-link].
 - Availability can change between the check and the final write. Microsoft remains the source of truth and may reject a raced slot.
 - Safe reads honor `429 Retry-After` responses. Appointment writes are intentionally not retried because a lost response could otherwise create duplicates.
+- Cancellation writes are also never retried. `cancel-all` targets only active records in the local database and always supports a no-write preview.
+- `.bookings/bookings.sqlite3` contains customer self-service cancellation capabilities. It is ignored by Git and should be kept private and backed up with the environment file.
 - The HTTP backend currently targets shared public Bookings pages, not personal Bookings pages or Microsoft Graph administration APIs.
 - Required custom questions and customer verification challenges are not currently modeled; use the Playwright backend for those pages.
 - High worker counts can trigger throttling or disrupt other customers. Use modest concurrency and respect the booking owner’s policies.

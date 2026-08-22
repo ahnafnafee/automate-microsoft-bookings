@@ -163,7 +163,12 @@ def test_http_automation_creates_public_appointment():
             captured["payload"] = json.loads(request.content)
             return httpx.Response(
                 201,
-                json={"appointment": {"id": "appointment-123"}},
+                json={
+                    "appointment": {
+                        "id": "appointment-123",
+                        "selfServiceAppointmentId": "self-service-123",
+                    }
+                },
             )
         return api_response(request)
 
@@ -176,6 +181,7 @@ def test_http_automation_creates_public_appointment():
     assert result["success"] is True
     assert result["backend"] == "http"
     assert result["appointment_id"] == "appointment-123"
+    assert result["self_service_appointment_id"] == "self-service-123"
 
     request = captured["request"]
     assert request.headers["x-owa-canary"] == OWA_CANARY_SENTINEL
@@ -274,6 +280,49 @@ def test_appointment_write_is_never_retried():
     assert result["success"] is False
     assert "HTTP 503" in result["message"]
     assert appointment_requests == 1
+
+
+def test_http_automation_cancels_self_service_appointment():
+    cancellation_requests = []
+
+    def handler(request):
+        if request.method == "DELETE":
+            cancellation_requests.append(request)
+            return httpx.Response(204)
+        return api_response(request)
+
+    automation, raw_client = make_automation(handler)
+    try:
+        result = automation.cancel_appointment(PAGE_URL, "self-service-123")
+    finally:
+        raw_client.close()
+
+    assert result["success"] is True
+    assert len(cancellation_requests) == 1
+    request = cancellation_requests[0]
+    assert request.url.path.endswith("/appointments/self-service-123")
+    assert "authorization" not in request.headers
+
+
+def test_cancellation_write_is_never_retried():
+    cancellation_requests = 0
+
+    def handler(request):
+        nonlocal cancellation_requests
+        if request.method == "DELETE":
+            cancellation_requests += 1
+            return httpx.Response(503, json={"message": "Service unavailable"})
+        return api_response(request)
+
+    automation, raw_client = make_automation(handler, max_retries=5)
+    try:
+        result = automation.cancel_appointment(PAGE_URL, "self-service-123")
+    finally:
+        raw_client.close()
+
+    assert result["success"] is False
+    assert "HTTP 503" in result["message"]
+    assert cancellation_requests == 1
 
 
 def test_adjacent_available_intervals_cover_appointment():

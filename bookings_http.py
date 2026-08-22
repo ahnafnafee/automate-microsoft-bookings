@@ -169,6 +169,22 @@ def _appointment_id(payload: Any) -> str | None:
     return str(value) if value else None
 
 
+def _self_service_appointment_id(payload: Any) -> str | None:
+    """Extract the customer capability used by the public management page."""
+    if not isinstance(payload, Mapping):
+        return None
+
+    for key in ("appointment", "bookingAppointment"):
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            value = nested.get("selfServiceAppointmentId")
+            if value:
+                return str(value)
+
+    value = payload.get("selfServiceAppointmentId")
+    return str(value) if value else None
+
+
 class BookingsHttpClient:
     """Session-oriented client for an unrestricted Microsoft Bookings page."""
 
@@ -674,6 +690,20 @@ class BookingsHttpClient:
             return {}
         return self._json_object(response, "appointment creation")
 
+    def cancel_appointment(self, self_service_appointment_id: str) -> None:
+        """Cancel one customer-managed appointment without retrying the write."""
+        appointment_id = str(self_service_appointment_id or "").strip()
+        if not appointment_id:
+            raise BookingSelectionError(
+                "A self-service appointment ID is required for cancellation"
+            )
+        encoded_id = quote(appointment_id, safe="")
+        self._api_request(
+            "DELETE",
+            f"appointments/{encoded_id}",
+            retry_safe=False,
+        )
+
 
 class HttpBookingAutomation:
     """Book configured appointments through the anonymous HTTP workflow."""
@@ -750,6 +780,7 @@ class HttpBookingAutomation:
                 )
                 result = client.create_appointment(payload)
                 appointment_id = _appointment_id(result)
+                self_service_appointment_id = _self_service_appointment_id(result)
                 id_suffix = f" (appointment {appointment_id})" if appointment_id else ""
                 return {
                     "success": True,
@@ -760,11 +791,34 @@ class HttpBookingAutomation:
                     "date": target_date.isoformat(),
                     "backend": "http",
                     "appointment_id": appointment_id,
+                    "self_service_appointment_id": self_service_appointment_id,
                 }
         except (BookingsHttpError, ValueError, OverflowError) as exc:
             return {
                 "success": False,
                 "message": f"HTTP booking failed: {exc}",
                 "date": target_date.isoformat(),
+                "backend": "http",
+            }
+
+    def cancel_appointment(
+        self,
+        page_url: str,
+        self_service_appointment_id: str,
+    ) -> dict[str, Any]:
+        """Cancel one appointment through its customer self-service capability."""
+        try:
+            with self._new_client(page_url) as client:
+                client.bootstrap()
+                client.cancel_appointment(self_service_appointment_id)
+            return {
+                "success": True,
+                "message": "Successfully cancelled appointment via HTTP",
+                "backend": "http",
+            }
+        except BookingsHttpError as exc:
+            return {
+                "success": False,
+                "message": f"HTTP cancellation failed: {exc}",
                 "backend": "http",
             }

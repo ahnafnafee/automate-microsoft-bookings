@@ -11,7 +11,7 @@ from pathlib import Path
 from datetime import date
 from dotenv import load_dotenv
 
-from date_utils import get_fridays_in_range, format_date_for_display
+from date_utils import WEEKDAY_NAMES, format_date_for_display, get_weekdays_in_range
 from booker import BookingConfig, create_booking_automation
 
 
@@ -65,9 +65,13 @@ def load_config() -> dict:
             "service": os.getenv("BOOKING_SERVICE"),
             "staff": os.getenv("BOOKING_STAFF"),
             "time_slot": os.getenv("BOOKING_TIME_SLOT"),
+            "weekday": os.getenv("BOOKING_WEEKDAY", "friday"),
             "backend": os.getenv("BOOKING_BACKEND", "http"),
             "http_timeout": os.getenv("BOOKING_HTTP_TIMEOUT"),
             "http_max_retries": os.getenv("BOOKING_HTTP_MAX_RETRIES"),
+            "ledger_path": os.getenv(
+                "BOOKING_LEDGER_PATH", ".bookings/bookings.sqlite3"
+            ),
         },
         "user": {
             "name": os.getenv("USER_NAME"),
@@ -144,6 +148,34 @@ def require_booking_url(config: dict) -> str:
     return url
 
 
+def resolve_booking_weekday(
+    config: dict, weekday: str | None = None
+) -> tuple[str, int]:
+    """Resolve a CLI or environment weekday to its Python weekday index."""
+    selected_weekday = str(
+        weekday or config["booking"].get("weekday") or "friday"
+    ).strip().casefold()
+    if selected_weekday not in WEEKDAY_NAMES:
+        raise click.ClickException(
+            f"BOOKING_WEEKDAY must be one of: {', '.join(WEEKDAY_NAMES)}"
+        )
+    return selected_weekday, WEEKDAY_NAMES.index(selected_weekday)
+
+
+def persist_booking_result(config: dict, run_id: str, result: dict) -> None:
+    """Persist one result without changing its booking outcome."""
+    from booking_ledger import BookingLedgerError, record_booking_result
+
+    try:
+        record_booking_result(
+            config["booking"]["ledger_path"],
+            run_id,
+            result,
+        )
+    except BookingLedgerError as exc:
+        click.echo(f"⚠️  Could not save the appointment result locally: {exc}")
+
+
 @click.group()
 @click.pass_context
 def cli(ctx):
@@ -156,15 +188,30 @@ def cli(ctx):
         sys.exit(1)
 
 
-def execute_booking_run(config, fridays, dry_run, headed, workers, backend=None):
+def execute_booking_run(
+    config,
+    booking_dates,
+    dry_run,
+    headed,
+    workers,
+    backend=None,
+    weekday="friday",
+    run_command="book-all",
+):
     """Helper to execute the booking loop using a list of dates."""
     import concurrent.futures
     from booker import run_single_booking
-    
-    click.echo(f"\n📅 Found {len(fridays)} Fridays to book:")
+
+    weekday_label = f"{weekday.capitalize()}s"
+    click.echo(f"\n📅 Found {len(booking_dates)} {weekday_label} to book:")
+    time_slot = config["booking"].get("time_slot")
+    service = config["booking"].get("service")
+    if time_slot:
+        service_label = f" ({service})" if service else ""
+        click.echo(f"🕓 Start time: {time_slot}{service_label}")
     click.echo("-" * 40)
-    for i, friday in enumerate(fridays, 1):
-        click.echo(f"  {i:2}. {format_date_for_display(friday)}")
+    for i, booking_date in enumerate(booking_dates, 1):
+        click.echo(f"  {i:2}. {format_date_for_display(booking_date)}")
     click.echo("-" * 40)
     
     if dry_run:
@@ -176,11 +223,28 @@ def execute_booking_run(config, fridays, dry_run, headed, workers, backend=None)
 
     # Confirm with user
     if not click.confirm(
-        f"\nProceed with booking {len(fridays)} dates through the "
+        f"\nProceed with booking {len(booking_dates)} dates through the "
         f"{selected_backend} backend using {workers} parallel workers?"
     ):
         click.echo("Cancelled.")
         return
+
+    from booking_ledger import BookingLedgerError, begin_run, finish_run
+
+    ledger_path = config["booking"]["ledger_path"]
+    try:
+        run_id = begin_run(
+            ledger_path,
+            booking_config,
+            command=run_command,
+            booking_dates=booking_dates,
+            weekday=weekday,
+        )
+    except BookingLedgerError as exc:
+        raise click.ClickException(
+            f"Cannot start booking without a local cancellation record: {exc}"
+        ) from exc
+    click.echo(f"\n🗃️  Local run ID: {run_id}")
 
     if headed and selected_backend == "http":
         click.echo("\nℹ️  --headed applies only to the Playwright backend.")
@@ -199,30 +263,45 @@ def execute_booking_run(config, fridays, dry_run, headed, workers, backend=None)
     with executor_type(max_workers=workers) as executor:
         # Submit all tasks
         future_to_date = {
-            executor.submit(run_single_booking, booking_config, friday, not headed): friday 
-            for friday in fridays
+            executor.submit(
+                run_single_booking, booking_config, booking_date, not headed
+            ): booking_date
+            for booking_date in booking_dates
         }
         
         # Process results as they complete
         for i, future in enumerate(concurrent.futures.as_completed(future_to_date), 1):
-            friday = future_to_date[future]
+            booking_date = future_to_date[future]
             try:
                 result = future.result()
                 results.append(result)
+                persist_booking_result(config, run_id, result)
                 
                 status_icon = "✅" if result["success"] else "❌"
-                click.echo(f"[{i}/{len(fridays)}] {status_icon} {format_date_for_display(friday)}: {result['message']}")
+                click.echo(f"[{i}/{len(booking_dates)}] {status_icon} {format_date_for_display(booking_date)}: {result['message']}")
                 
             except Exception as exc:
-                click.echo(f"[{i}/{len(fridays)}] 💥 {format_date_for_display(friday)} generated an exception: {exc}")
-                results.append({"success": False, "message": str(exc), "date": friday.isoformat()})
+                click.echo(f"[{i}/{len(booking_dates)}] 💥 {format_date_for_display(booking_date)} generated an exception: {exc}")
+                result = {
+                    "success": False,
+                    "message": str(exc),
+                    "date": booking_date.isoformat(),
+                    "backend": selected_backend,
+                }
+                results.append(result)
+                persist_booking_result(config, run_id, result)
+
+    try:
+        finish_run(ledger_path, run_id)
+    except BookingLedgerError as exc:
+        click.echo(f"⚠️  Could not finalize local run {run_id}: {exc}")
 
     # Summary
     successful = sum(1 for r in results if r["success"])
     click.echo(f"\n{'='*40}")
-    click.echo(f"📊 Summary: {successful}/{len(fridays)} bookings successful")
+    click.echo(f"📊 Summary: {successful}/{len(booking_dates)} bookings successful")
     
-    if successful < len(fridays):
+    if successful < len(booking_dates):
         click.echo("\n❌ Failed bookings:")
         for r in results:
             if not r["success"]:
@@ -245,12 +324,17 @@ def execute_booking_run(config, fridays, dry_run, headed, workers, backend=None)
     default=None,
     help="Override BOOKING_BACKEND",
 )
+@click.option(
+    "--weekday",
+    type=click.Choice(WEEKDAY_NAMES, case_sensitive=False),
+    default=None,
+    help="Override BOOKING_WEEKDAY",
+)
 @click.pass_context
-def book_all(ctx, dry_run, headed, workers, backend):
-    """Book all Fridays in the configured semester range."""
+def book_all(ctx, dry_run, headed, workers, backend, weekday):
+    """Book the configured weekday throughout the semester range."""
     config = ctx.obj["config"]
 
-    # Get all Friday dates
     start_date = config["semester"]["start_date"]
     end_date = config["semester"]["end_date"]
     skip_dates = config["semester"]["skip_dates"]
@@ -258,8 +342,20 @@ def book_all(ctx, dry_run, headed, workers, backend):
     if not start_date or not end_date:
         raise click.ClickException("SEMESTER_START_DATE and SEMESTER_END_DATE are required in .env for book-all")
 
-    fridays = get_fridays_in_range(start_date, end_date, skip_dates)
-    execute_booking_run(config, fridays, dry_run, headed, workers, backend)
+    weekday_name, weekday_index = resolve_booking_weekday(config, weekday)
+    booking_dates = get_weekdays_in_range(
+        start_date, end_date, weekday_index, skip_dates
+    )
+    execute_booking_run(
+        config,
+        booking_dates,
+        dry_run,
+        headed,
+        workers,
+        backend,
+        weekday=weekday_name,
+        run_command="book-all",
+    )
 
 @cli.command()
 @click.argument("semester", type=click.Choice(["fall", "spring", "summer"], case_sensitive=False))
@@ -280,9 +376,15 @@ def book_all(ctx, dry_run, headed, workers, backend):
     default=None,
     help="Override BOOKING_BACKEND",
 )
+@click.option(
+    "--weekday",
+    type=click.Choice(WEEKDAY_NAMES, case_sensitive=False),
+    default=None,
+    help="Override BOOKING_WEEKDAY",
+)
 @click.pass_context
-def book_semester(ctx, semester, year, dry_run, headed, workers, backend):
-    """Automatically fetch semester dates and book all Fridays."""
+def book_semester(ctx, semester, year, dry_run, headed, workers, backend, weekday):
+    """Fetch semester dates and book the configured weekday."""
     from calendar_parser import fetch_and_parse_calendar
 
     config = ctx.obj["config"]
@@ -313,9 +415,21 @@ def book_semester(ctx, semester, year, dry_run, headed, workers, backend):
     if skip_dates:
         click.echo(f"⏭️  Skipping Dates: {', '.join(skip_dates)}")
 
-    fridays = get_fridays_in_range(start_date, end_date, skip_dates)
+    weekday_name, weekday_index = resolve_booking_weekday(config, weekday)
+    booking_dates = get_weekdays_in_range(
+        start_date, end_date, weekday_index, skip_dates
+    )
 
-    execute_booking_run(config, fridays, dry_run, headed, workers, backend)
+    execute_booking_run(
+        config,
+        booking_dates,
+        dry_run,
+        headed,
+        workers,
+        backend,
+        weekday=weekday_name,
+        run_command=f"book-semester {semester.lower()} {year}",
+    )
 
 
 @cli.command()
@@ -338,23 +452,48 @@ def book_single(ctx, date_str, headed, backend):
         target_date = parse(date_str).date()
     except ValueError:
         raise click.ClickException(f"Invalid date format: {date_str}. Use YYYY-MM-DD")
-    
-    # Validate it's a Friday
-    if target_date.weekday() != 4:
-        click.echo(f"⚠️  Warning: {format_date_for_display(target_date)} is not a Friday!")
+
+    booking_config = create_booking_config(config, backend)
+
+    weekday_name, weekday_index = resolve_booking_weekday(config)
+    if target_date.weekday() != weekday_index:
+        click.echo(
+            f"⚠️  Warning: {format_date_for_display(target_date)} is not a "
+            f"{weekday_name.capitalize()}!"
+        )
         if not click.confirm("Continue anyway?"):
             return
     
     click.echo(f"\n📅 Booking: {format_date_for_display(target_date)}")
-    
-    # Create automation instance
-    booking_config = create_booking_config(config, backend)
+
+    from booking_ledger import BookingLedgerError, begin_run, finish_run
+
+    ledger_path = config["booking"]["ledger_path"]
+    try:
+        run_id = begin_run(
+            ledger_path,
+            booking_config,
+            command="book-single",
+            booking_dates=[target_date],
+            weekday=weekday_name,
+        )
+    except BookingLedgerError as exc:
+        raise click.ClickException(
+            f"Cannot book without a local cancellation record: {exc}"
+        ) from exc
+    click.echo(f"🗃️  Local run ID: {run_id}")
+
     if headed and booking_config.backend == "http":
         click.echo("ℹ️  --headed applies only to the Playwright backend.")
     automation = create_booking_automation(booking_config, headless=not headed)
     
     result = automation.book_date(booking_config, target_date)
-    
+    persist_booking_result(config, run_id, result)
+    try:
+        finish_run(ledger_path, run_id)
+    except BookingLedgerError as exc:
+        click.echo(f"⚠️  Could not finalize local run {run_id}: {exc}")
+
     if result["success"]:
         click.echo(f"✅ {result['message']}")
     else:
@@ -362,9 +501,189 @@ def book_single(ctx, date_str, headed, backend):
 
 
 @cli.command()
+@click.option("--dry-run", is_flag=True, help="Show cancellations without writing")
+@click.option(
+    "--from-date",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    help="Cancel appointments on or after YYYY-MM-DD",
+)
+@click.option(
+    "--to-date",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    help="Cancel appointments on or before YYYY-MM-DD",
+)
+@click.option(
+    "--run-id",
+    help="Cancel only appointments created by one local run",
+)
+@click.option(
+    "--ledger-path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override BOOKING_LEDGER_PATH",
+)
 @click.pass_context
-def list_dates(ctx):
-    """List all Fridays that would be booked."""
+def cancel_all(ctx, dry_run, from_date, to_date, run_id, ledger_path):
+    """Cancel active appointments recorded in the private local ledger."""
+    from booking_ledger import (
+        BookingLedgerError,
+        active_bookings,
+        record_cancellation_result,
+    )
+    from bookings_http import HttpBookingAutomation
+
+    config = ctx.obj["config"]
+    selected_path = ledger_path or Path(config["booking"]["ledger_path"])
+    from_iso = from_date.date().isoformat() if from_date else None
+    to_iso = to_date.date().isoformat() if to_date else None
+    if from_iso and to_iso and from_iso > to_iso:
+        raise click.ClickException("--from-date cannot be after --to-date")
+
+    try:
+        records = active_bookings(
+            selected_path,
+            run_id=run_id,
+            from_date=from_iso,
+            to_date=to_iso,
+        )
+    except BookingLedgerError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if not records:
+        click.echo(f"No active appointments found in {selected_path}.")
+        return
+
+    click.echo(f"\n🧾 Found {len(records)} active appointments in the ledger:")
+    click.echo("-" * 56)
+    for index, record in enumerate(records, 1):
+        automatic = bool(
+            record.get("booking_url")
+            and record.get("self_service_appointment_id")
+        )
+        mode = "automatic" if automatic else "manual cancellation required"
+        click.echo(
+            f"  {index:2}. {record.get('booking_date', 'unknown date')} at "
+            f"{record.get('time_slot', 'unknown time')} [{mode}]"
+        )
+    click.echo("-" * 56)
+
+    if dry_run:
+        click.echo("\n🔍 DRY RUN - No cancellations will be made.")
+        return
+
+    cancellable = [
+        record
+        for record in records
+        if record.get("booking_url")
+        and record.get("self_service_appointment_id")
+    ]
+    unsupported_count = len(records) - len(cancellable)
+    if unsupported_count:
+        click.echo(
+            f"⚠️  {unsupported_count} appointments lack a customer "
+            "self-service ID and cannot be cancelled automatically."
+        )
+    if not cancellable:
+        raise click.ClickException("No appointments can be cancelled automatically")
+
+    if not click.confirm(
+        f"\nPermanently cancel {len(cancellable)} appointments?"
+    ):
+        click.echo("Cancelled.")
+        return
+
+    timeout = _positive_float(
+        config["booking"].get("http_timeout"),
+        "BOOKING_HTTP_TIMEOUT",
+        20.0,
+    )
+    max_retries = _nonnegative_int(
+        config["booking"].get("http_max_retries"),
+        "BOOKING_HTTP_MAX_RETRIES",
+        2,
+    )
+    automation = HttpBookingAutomation(
+        timeout=timeout,
+        max_retries=max_retries,
+    )
+
+    successful = 0
+    for index, record in enumerate(cancellable, 1):
+        result = automation.cancel_appointment(
+            str(record["booking_url"]),
+            str(record["self_service_appointment_id"]),
+        )
+        if result["success"]:
+            successful += 1
+        try:
+            record_cancellation_result(
+                selected_path,
+                str(record["record_id"]),
+                result,
+            )
+        except BookingLedgerError as exc:
+            raise click.ClickException(
+                f"The cancellation result for {record.get('booking_date')} "
+                f"could not be saved: {exc}"
+            ) from exc
+        status_icon = "✅" if result["success"] else "❌"
+        click.echo(
+            f"[{index}/{len(cancellable)}] {status_icon} "
+            f"{record.get('booking_date')}: {result['message']}"
+        )
+
+    click.echo(
+        f"\n📊 Cancellation summary: {successful}/{len(cancellable)} successful"
+    )
+
+
+@cli.command("list-runs")
+@click.option(
+    "--ledger-path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override BOOKING_LEDGER_PATH",
+)
+@click.pass_context
+def list_booking_runs(ctx, ledger_path):
+    """List locally recorded booking runs."""
+    from booking_ledger import BookingLedgerError, list_runs
+
+    config = ctx.obj["config"]
+    selected_path = ledger_path or Path(config["booking"]["ledger_path"])
+    try:
+        runs = list_runs(selected_path)
+    except BookingLedgerError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if not runs:
+        click.echo(f"No booking runs found in {selected_path}.")
+        return
+
+    click.echo(f"\n🗃️  Booking runs in {selected_path}:")
+    click.echo("-" * 72)
+    for run in runs:
+        click.echo(
+            f"{run['run_id']}  {run['command']}  "
+            f"{run['successful_count']}/{run['requested_count']} booked"
+        )
+        click.echo(
+            f"    {run['weekday'] or 'single date'} at {run['time_slot']} · "
+            f"{run['created_at']}"
+        )
+    click.echo("-" * 72)
+
+
+@cli.command()
+@click.option(
+    "--weekday",
+    type=click.Choice(WEEKDAY_NAMES, case_sensitive=False),
+    default=None,
+    help="Override BOOKING_WEEKDAY",
+)
+@click.pass_context
+def list_dates(ctx, weekday):
+    """List all recurring dates that would be booked."""
     config = ctx.obj["config"]
     
     start_date = config["semester"]["start_date"]
@@ -377,17 +696,24 @@ def list_dates(ctx):
             "for list-dates"
         )
     
-    fridays = get_fridays_in_range(start_date, end_date, skip_dates)
-    
-    click.echo(f"\n📅 Fridays in semester ({start_date} to {end_date}):")
+    weekday_name, weekday_index = resolve_booking_weekday(config, weekday)
+    booking_dates = get_weekdays_in_range(
+        start_date, end_date, weekday_index, skip_dates
+    )
+    weekday_label = f"{weekday_name.capitalize()}s"
+
+    click.echo(f"\n📅 {weekday_label} in semester ({start_date} to {end_date}):")
     click.echo(f"   Skipping: {', '.join(skip_dates) if skip_dates else 'None'}")
     click.echo("-" * 40)
     
-    for i, friday in enumerate(fridays, 1):
-        click.echo(f"  {i:2}. {format_date_for_display(friday)} ({friday.isoformat()})")
+    for i, booking_date in enumerate(booking_dates, 1):
+        click.echo(
+            f"  {i:2}. {format_date_for_display(booking_date)} "
+            f"({booking_date.isoformat()})"
+        )
     
     click.echo("-" * 40)
-    click.echo(f"Total: {len(fridays)} Fridays")
+    click.echo(f"Total: {len(booking_dates)} {weekday_label}")
 
 
 @cli.command()
