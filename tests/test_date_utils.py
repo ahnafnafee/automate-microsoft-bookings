@@ -1,5 +1,9 @@
 from datetime import date
-from date_utils import get_fridays_in_range, format_date_for_display
+from date_utils import (
+    format_date_for_display,
+    get_fridays_in_range,
+    get_weekdays_in_range,
+)
 
 def test_get_fridays_in_range():
     # Feb 2026 has fridays on 6, 13, 20, 27
@@ -32,6 +36,17 @@ def test_get_fridays_in_range_exact_friday():
     assert len(fridays) == 2
     assert fridays[0] == date(2026, 2, 6)
     assert fridays[1] == date(2026, 2, 13)
+
+
+def test_get_thursdays_in_range_with_skip():
+    dates = get_weekdays_in_range(
+        "2026-08-24",
+        "2026-09-10",
+        3,
+        ["2026-09-03"],
+    )
+
+    assert dates == [date(2026, 8, 27), date(2026, 9, 10)]
 
 def test_format_date_for_display():
     d = date(2026, 2, 6)

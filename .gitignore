@@ -36,6 +36,7 @@ config.yaml
 debug_screenshots/
 playwright-report/
 test-results/
+.bookings/
 
 # VS Code
 .vscode/
